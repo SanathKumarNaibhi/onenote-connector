@@ -132,11 +132,23 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
     return [...seen.values()];
   }
 
+  // SYNC_EXCLUDE entries: "Notebook/Section", "Section", or "Notebook/*" for a whole notebook.
   const isExcluded = (s) =>
     exclude.some((x) => {
       const [nb, sec] = x.includes("/") ? x.split("/").map((t) => t.trim().toLowerCase()) : [null, x.trim().toLowerCase()];
-      return sec === (s.name || "").toLowerCase() && (!nb || nb === (s.notebook || "").toLowerCase());
+      const nbOk = !nb || nb === (s.notebook || "").toLowerCase();
+      return nbOk && (sec === "*" || sec === (s.name || "").toLowerCase());
     });
+
+  // An excluded section's pages are removed from the copy (they still live in OneNote).
+  function dropSection(id) {
+    for (const p of db.prepare("SELECT id, file_path FROM pages WHERE section_id = ?").all(id)) {
+      removeFile(dataDir, p.file_path);
+      db.prepare("DELETE FROM page_fts WHERE page_id = ?").run(p.id);
+      db.prepare("DELETE FROM page_versions WHERE page_id = ?").run(p.id);
+    }
+    return db.prepare("DELETE FROM pages WHERE section_id = ?").run(id).changes;
+  }
 
   // ---- One section ----
   const upsertSection = db.prepare(`
@@ -234,6 +246,10 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
         "/me/onenote/sections?$select=id,displayName,lastModifiedDateTime&$expand=parentNotebook($select=displayName),parentSectionGroup($select=displayName)&$top=100",
       );
       stats.sectionsChecked = sections.length;
+      // One notebook at a time, its sections in name order.
+      sections.sort((a, b) =>
+        (a.parentNotebook?.displayName || "").localeCompare(b.parentNotebook?.displayName || "") ||
+        (a.displayName || "").localeCompare(b.displayName || ""));
       for (const raw of sections) {
         const s = {
           id: raw.id,
@@ -244,7 +260,9 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
         };
         upsertSection.run(s.id, s.name, s.notebook, s.group, s.modified);
         if (isExcluded(s)) {
-          db.prepare("UPDATE sections SET status = 'excluded' WHERE id = ?").run(s.id);
+          db.prepare("UPDATE sections SET status = 'excluded', page_count = 0 WHERE id = ?").run(s.id);
+          const dropped = dropSection(s.id);
+          if (dropped) log.log(`Excluded ${s.notebook} › ${s.name}: removed ${dropped} pages from the copy.`);
           stats.skipped.push(`${s.notebook} › ${s.name} (excluded)`);
           continue;
         }

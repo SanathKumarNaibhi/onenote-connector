@@ -41,7 +41,7 @@ Optional environment variables:
 | `SYNC_HOURLY_BUDGET` | `300` | Requests per rolling hour the sync may use (50–380; Microsoft's cap is 400) |
 | `SYNC_PER_MINUTE` | `30` | Requests per minute the sync may use (max 100; Microsoft's cap is 120) |
 | `FULL_RESYNC_DAYS` | `30` | Days between full re-reads of every section |
-| `SYNC_EXCLUDE` | (none) | Comma-separated sections to leave out of the copy, as `Notebook/Section` or `Section` |
+| `SYNC_EXCLUDE` | (none) | Comma-separated things to leave out of the copy: `Notebook/Section`, `Section`, or `Notebook/*` for a whole notebook. Pages already copied from them are removed from the copy (they stay in OneNote). |
 | `DATA_DIR` | `/data` | Where the copy lives |
 
 ## Security notes
