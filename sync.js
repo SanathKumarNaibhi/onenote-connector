@@ -11,7 +11,14 @@ import {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientSecret, scopes, allowedEmail, htmlToText, exclude = [], log = console }) {
+class ThrottledError extends Error {
+  constructor() {
+    super("Microsoft is rate-limiting requests for this account; the sync paused and resumes at the next scheduled run.");
+    this.throttled = true;
+  }
+}
+
+export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientSecret, scopes, allowedEmail, htmlToText, exclude = [], paceMs = 3000, log = console }) {
   let running = null; // the promise of the sync in progress
   let lastRun = null; // summary of the last finished run
 
@@ -54,15 +61,26 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
     }
   }
 
-  // GET with retries on throttling (429) and brief server errors.
+  // GET, paced so the sync never uses up the account's Microsoft quota (Claude's live reads
+  // share it). On throttling it backs off; if Microsoft keeps refusing, the whole run stops
+  // and resumes at the next scheduled sync instead of failing page after page.
+  let nextSlot = 0;
   async function get(pathOrUrl, { asText = false } = {}) {
     const url = pathOrUrl.startsWith("http") ? pathOrUrl : graphBase + pathOrUrl;
     for (let attempt = 0; ; attempt++) {
+      const wait = nextSlot - Date.now();
+      if (wait > 0) await sleep(wait);
+      nextSlot = Date.now() + paceMs;
       const r = await fetch(url, { headers: { Authorization: `Bearer ${await accessToken()}` } });
       if (r.ok) return asText ? r.text() : r.json();
-      if ((r.status === 429 || r.status >= 500) && attempt < 5) {
-        const wait = Number(r.headers.get("retry-after")) * 1000 || 2000 * 2 ** attempt;
-        await sleep(Math.min(wait, 60_000));
+      if (r.status === 429) {
+        if (attempt >= 2) throw new ThrottledError();
+        const retryAfter = Number(r.headers.get("retry-after")) * 1000 || 60_000 * (attempt + 1);
+        await sleep(Math.min(retryAfter, 5 * 60_000));
+        continue;
+      }
+      if (r.status >= 500 && attempt < 3) {
+        await sleep(2000 * 2 ** attempt);
         continue;
       }
       if (r.status === 401 && attempt < 1) {
@@ -113,6 +131,7 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
         `/me/onenote/sections/${encodeURIComponent(s.id)}/pages?$select=id,title,createdDateTime,lastModifiedDateTime&$top=100`,
       );
     } catch (e) {
+      if (e.throttled) throw e;
       const status = e.status === 403 ? "encrypted" : "error";
       db.prepare("UPDATE sections SET status = ?, error = ?, last_synced = ? WHERE id = ?").run(status, e.message, nowIso(), s.id);
       if (status === "error") stats.errors.push(`${s.notebook} › ${s.name}: ${e.message}`);
@@ -129,6 +148,7 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
       try {
         html = await get(`/me/onenote/pages/${encodeURIComponent(p.id)}/content`, { asText: true });
       } catch (e) {
+        if (e.throttled) throw e;
         ok = false;
         stats.errors.push(`${s.notebook} › ${s.name} › ${meta.title}: ${e.message}`);
         if (!old)
@@ -219,6 +239,7 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
       }
       setMeta(db, "last_success", nowIso());
     } catch (e) {
+      if (e.throttled) stats.throttled = true;
       stats.errors.unshift(e.message);
     }
     stats.finished = nowIso();

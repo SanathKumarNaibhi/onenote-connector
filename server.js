@@ -41,7 +41,8 @@ const TOKEN_URL = `${LOGIN_BASE}/${MS_TENANT}/oauth2/v2.0/token`;
 const DATA_DIR = env.DATA_DIR || "/data";
 const SYNC_INTERVAL_MIN = Math.max(15, Number(env.SYNC_INTERVAL_MIN || 60));
 const FULL_RESYNC_DAYS = Math.max(1, Number(env.FULL_RESYNC_DAYS || 7)); // re-read everything weekly, in case a section date didn't move
-const SYNC_EXCLUDE = (env.SYNC_EXCLUDE || "").split(",").map((s) => s.trim()).filter(Boolean); // e.g. "Sanath Kumar's Notebook/Archive"
+const SYNC_PACE_MS = Math.max(0, Number(env.SYNC_PACE_MS ?? 3000)); // gap between Microsoft requests during sync (~20/min)
+const SYNC_EXCLUDE =(env.SYNC_EXCLUDE || "").split(",").map((s) => s.trim()).filter(Boolean); // e.g. "Sanath Kumar's Notebook/Archive"
 
 // ---------- Small helpers ----------
 const noStore = (res) => res.set("Cache-Control", "no-store");
@@ -453,15 +454,20 @@ const sync = createSync({
   allowedEmail: ALLOWED_EMAIL,
   htmlToText,
   exclude: SYNC_EXCLUDE,
+  paceMs: SYNC_PACE_MS,
 });
 
+// Normal runs re-read only sections whose date moved (or that didn't finish last time), so the
+// first copy simply continues run after run. A full re-read happens once every FULL_RESYNC_DAYS,
+// counted from when the first copy completed.
 function scheduledSync() {
   const lastFull = db.prepare("SELECT value FROM meta WHERE key = 'last_full'").get()?.value;
-  const full = !lastFull || Date.now() - Date.parse(lastFull) > FULL_RESYNC_DAYS * 86_400_000;
+  const full = Boolean(lastFull) && Date.now() - Date.parse(lastFull) > FULL_RESYNC_DAYS * 86_400_000;
   sync
     .start(full ? "scheduled full" : "scheduled", { full })
     .then((s) => {
-      if (full && !s.errors.length) db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES('last_full', ?)").run(new Date().toISOString());
+      const complete = !s.throttled && !db.prepare("SELECT 1 FROM sections WHERE status IN ('error','partial') OR (status IS NULL)").get();
+      if (complete && (full || !lastFull)) db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES('last_full', ?)").run(new Date().toISOString());
     })
     .catch((e) => console.warn("Scheduled sync failed:", e.message));
 }

@@ -6,8 +6,9 @@ A private, read-only MCP connector for one personal Microsoft account's OneNote.
 ## What it does
 
 - **Live tools**: list notebooks, sections and pages; read any page (headed with its notebook and section).
-- **Local copy** (in `/data`): every page's HTML and text, refreshed every hour; only sections whose
-  date moved are re-read, plus a full pass once a week.
+- **VPS copy** (in `/data`): every page's HTML and text, refreshed every hour; only sections whose
+  date moved are re-read, plus a full pass once a week. Requests are paced (about 20 a minute), and if
+  Microsoft rate-limits the account the run pauses and continues at the next hourly sync.
 - **Full-text search** over titles and page text, in any script (English, Kannada, transliteration).
   Any 3+ letter fragment matches.
 - **Backup behaviour**: pages deleted in OneNote are kept and marked deleted. Each time a page's
@@ -33,6 +34,7 @@ Optional environment variables:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SYNC_INTERVAL_MIN` | `60` | Minutes between syncs (minimum 15) |
+| `SYNC_PACE_MS` | `3000` | Gap between Microsoft requests during a sync. Lower is faster but risks Microsoft's rate limit, which also blocks Claude's live reads |
 | `FULL_RESYNC_DAYS` | `7` | Days between full re-reads of every section |
 | `SYNC_EXCLUDE` | (none) | Comma-separated sections to leave out of the copy, as `Notebook/Section` or `Section` |
 | `DATA_DIR` | `/data` | Where the copy lives |
