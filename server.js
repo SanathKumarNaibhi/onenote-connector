@@ -48,7 +48,13 @@ const TESTING = env.BUDGET_TEST_MODE === "1"; // only for the automated tests ag
 const SYNC_HOURLY_BUDGET = TESTING ? Number(env.SYNC_HOURLY_BUDGET) : Math.min(380, Math.max(50, Number(env.SYNC_HOURLY_BUDGET || 300)));
 const SYNC_PER_MINUTE = TESTING ? Number(env.SYNC_PER_MINUTE) : Math.min(100, Math.max(1, Number(env.SYNC_PER_MINUTE || 30)));
 const THROTTLE_PAUSE_MS = TESTING ? Number(env.THROTTLE_PAUSE_MS) : 15 * 60_000;
-const SYNC_EXCLUDE =(env.SYNC_EXCLUDE || "").split(",").map((s) => s.trim()).filter(Boolean); // e.g. "Sanath Kumar's Notebook/Archive"
+// e.g. "Sanath Kumar's Notebook 1/*". Tolerates quotes around the value and around each entry.
+const SYNC_EXCLUDE = (env.SYNC_EXCLUDE || "")
+  .trim()
+  .replace(/^(["'])(.*)\1$/, "$2")
+  .split(",")
+  .map((s) => s.trim().replace(/^(["'])(.*)\1$/, "$2").trim())
+  .filter(Boolean);
 
 // ---------- Small helpers ----------
 const noStore = (res) => res.set("Cache-Control", "no-store");

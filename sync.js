@@ -133,11 +133,13 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
   }
 
   // SYNC_EXCLUDE entries: "Notebook/Section", "Section", or "Notebook/*" for a whole notebook.
+  const norm = (t) => String(t || "").replace(/[\u2018\u2019\u02BC`´]/g, "'").replace(/\s+/g, " ").trim().toLowerCase();
   const isExcluded = (s) =>
     exclude.some((x) => {
-      const [nb, sec] = x.includes("/") ? x.split("/").map((t) => t.trim().toLowerCase()) : [null, x.trim().toLowerCase()];
-      const nbOk = !nb || nb === (s.notebook || "").toLowerCase();
-      return nbOk && (sec === "*" || sec === (s.name || "").toLowerCase());
+      const i = x.lastIndexOf("/");
+      const [nb, sec] = i >= 0 ? [norm(x.slice(0, i)), norm(x.slice(i + 1))] : [null, norm(x)];
+      const nbOk = !nb || nb === norm(s.notebook);
+      return nbOk && (sec === "*" || sec === norm(s.name));
     });
 
   // An excluded section's pages are removed from the copy (they still live in OneNote).
@@ -332,6 +334,7 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
       pages_failing: counts.failing || 0,
       earlier_versions_kept: counts.versions,
       sections: Object.fromEntries(sections.map((r) => [r.status || "pending", r.n])),
+      excluding: exclude,
       last_run: last,
     };
   }
