@@ -1,8 +1,11 @@
 // OneNote connector for Claude (read-only).
 // Exposes your personal OneNote notebooks to Claude through the MCP protocol,
-// and signs you in with Microsoft. Nothing is stored on this server.
+// and signs you in with Microsoft. It also keeps a full local copy of your notes
+// (in DATA_DIR) for full-text search and as a backup. It never writes to OneNote.
 
 import express from "express";
+import { openStore, searchIndex } from "./store.js";
+import { createSync } from "./sync.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { convert } from "html-to-text";
@@ -33,6 +36,12 @@ if (missing.length) {
 
 const AUTHORIZE_URL = `${LOGIN_BASE}/${MS_TENANT}/oauth2/v2.0/authorize`;
 const TOKEN_URL = `${LOGIN_BASE}/${MS_TENANT}/oauth2/v2.0/token`;
+
+// Local copy + sync settings
+const DATA_DIR = env.DATA_DIR || "/data";
+const SYNC_INTERVAL_MIN = Math.max(15, Number(env.SYNC_INTERVAL_MIN || 60));
+const FULL_RESYNC_DAYS = Math.max(1, Number(env.FULL_RESYNC_DAYS || 7)); // re-read everything weekly, in case a section date didn't move
+const SYNC_EXCLUDE = (env.SYNC_EXCLUDE || "").split(",").map((s) => s.trim()).filter(Boolean); // e.g. "Sanath Kumar's Notebook/Archive"
 
 // ---------- Small helpers ----------
 const noStore = (res) => res.set("Cache-Control", "no-store");
@@ -96,6 +105,49 @@ const slim = (p) => ({
   ...(p.parentSection?.displayName ? { section: p.parentSection.displayName } : {}),
 });
 
+// Every section in every notebook, with its notebook's name. Follows Microsoft's paging links.
+async function allSections(token) {
+  let url = `/me/onenote/sections?${q({
+    $select: "id,displayName,lastModifiedDateTime",
+    $expand: "parentNotebook($select=id,displayName)",
+    $top: 100,
+  })}`;
+  const out = [];
+  while (url) {
+    const d = await graph(token, url);
+    for (const s of d.value)
+      out.push({ id: s.id, name: s.displayName, notebook: s.parentNotebook?.displayName, modified: s.lastModifiedDateTime });
+    url = d["@odata.nextLink"];
+  }
+  return out;
+}
+
+// Pages of one section (Microsoft refuses account-wide page queries when there are many sections).
+const sectionPages = (token, sectionId, top) =>
+  graph(
+    token,
+    `/me/onenote/sections/${encodeURIComponent(sectionId)}/pages?${q({
+      $select: pageFields,
+      $orderby: "lastModifiedDateTime desc",
+      $top: top,
+    })}`,
+  ).then((d) => d.value);
+
+// Runs fn over items a few at a time, so Microsoft doesn't rate-limit us.
+async function mapLimited(items, n, fn) {
+  const results = new Array(items.length);
+  let i = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(n, items.length) }, async () => {
+      while (i < items.length) {
+        const k = i++;
+        results[k] = await fn(items[k]);
+      }
+    }),
+  );
+  return results;
+}
+
 // ---------- The tools Claude can use ----------
 function buildServer(token) {
   const server = new McpServer(
@@ -142,10 +194,7 @@ function buildServer(token) {
           : notebook_id
             ? `/me/onenote/notebooks/${encodeURIComponent(notebook_id)}`
             : null;
-        if (!base) {
-          const d = await graph(token, `/me/onenote/sections?${q({ ...sel, $top: 100 })}`);
-          return asJson(d.value.map((s) => ({ id: s.id, name: s.displayName, modified: s.lastModifiedDateTime })));
-        }
+        if (!base) return asJson(await allSections(token));
         const [secs, groups] = await Promise.all([
           graph(token, `${base}/sections?${q(sel)}`),
           graph(token, `${base}/sectionGroups?${q(sel)}`),
@@ -192,22 +241,50 @@ function buildServer(token) {
     "recent_pages",
     {
       title: "Recently modified pages",
-      description: "The most recently modified pages across all notebooks, with the section each belongs to.",
-      inputSchema: { limit: z.number().int().min(1).max(100).optional().describe("How many pages (default 20)") },
+      description:
+        "Pages that were added or changed recently, across all notebooks, with notebook and section. Once the local copy exists, " +
+        "'changed_at' is when the sync actually saw the page's content change (reliable even though Microsoft's own page dates are not); " +
+        "pass since to get everything changed after a date. Before the first sync it falls back to the most recently edited sections.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(100).optional().describe("How many pages (default 20)"),
+        since: z.string().optional().describe("Only pages changed after this date (YYYY-MM-DD or ISO time); local copy only"),
+        sections: z.number().int().min(1).max(30).optional().describe("Fallback mode: how many recently edited sections to scan (default 8)"),
+      },
       annotations: readOnly,
     },
-    async ({ limit }) => {
+    async ({ limit, since, sections }) => {
       try {
-        const d = await graph(
-          token,
-          `/me/onenote/pages?${q({
-            $select: pageFields,
-            $expand: "parentSection($select=id,displayName)",
-            $orderby: "lastModifiedDateTime desc",
-            $top: clampLimit(limit, 20),
-          })}`,
+        if (hasCopy()) {
+          const rows = db
+            .prepare(
+              `SELECT id, title, notebook, section, section_id, created, changed_at, deleted_at FROM pages
+               WHERE changed_at IS NOT NULL AND changed_at > ? ORDER BY changed_at DESC LIMIT ?`,
+            )
+            .all(since || "", clampLimit(limit, 20));
+          return asJson({
+            source: "local copy",
+            note: "The first full sync marks every page as changed on the day it ran; later dates are real edits.",
+            last_sync: sync.status().last_success,
+            pages: rows.map((r) => ({ ...r })),
+          });
+        }
+        const recent = (await allSections(token))
+          .sort((a, b) => String(b.modified).localeCompare(String(a.modified)))
+          .slice(0, clampLimit(sections, 8, 30));
+        const perSection = await mapLimited(recent, 4, async (s) =>
+          (await sectionPages(token, s.id, 10)).map((p) => ({
+            ...slim(p),
+            section: s.name,
+            section_id: s.id,
+            notebook: s.notebook,
+            section_modified: s.modified,
+          })),
         );
-        return asJson(d.value.map(slim));
+        const pages = perSection
+          .flat()
+          .sort((a, b) => String(b.modified).localeCompare(String(a.modified)))
+          .slice(0, clampLimit(limit, 20));
+        return asJson({ recently_edited_sections: recent, pages });
       } catch (e) {
         return fail(e);
       }
@@ -219,25 +296,45 @@ function buildServer(token) {
     {
       title: "Search pages",
       description:
-        "Search OneNote pages for a word or phrase (best effort: Microsoft's search can miss recent edits). If it returns nothing, browse with list_sections and list_pages.",
+        "Full-text search across every notebook: page titles AND page text, in any script (English, Kannada, transliterated Sanskrit). " +
+        "All words must appear; any 3+ letter fragment matches (\"practis\" finds practice, practising). Results carry notebook, section " +
+        "and a snippet with the match in «». Searches the local copy kept by the sync; before the first sync finishes it falls back " +
+        "to matching page titles only. Password-protected sections are never included.",
       inputSchema: {
-        query: z.string().min(1).describe("Text to search for"),
+        query: z.string().min(1).describe("Words to search for"),
         limit: z.number().int().min(1).max(100).optional().describe("How many results (default 20)"),
+        include_deleted: z.boolean().optional().describe("Also return pages since deleted in OneNote but kept in the backup"),
       },
       annotations: readOnly,
     },
-    async ({ query, limit }) => {
+    async ({ query, limit, include_deleted }) => {
       try {
-        const d = await graph(
-          token,
-          `/me/onenote/pages?${q({
-            search: query,
-            $select: pageFields,
-            $expand: "parentSection($select=id,displayName)",
-            $top: clampLimit(limit, 20),
-          })}`,
-        );
-        return d.value.length ? asJson(d.value.map(slim)) : ok("No pages matched. Try fewer words, or browse with list_sections / list_pages.");
+        if (hasCopy()) {
+          const hits = searchIndex(db, query, 200)
+            .filter((r) => include_deleted || !r.deleted_at)
+            .slice(0, clampLimit(limit, 20));
+          return hits.length
+            ? asJson({
+                source: "local copy (full text)",
+                last_sync: sync.status().last_success,
+                ...(sync.status().last_success ? {} : { note: "The first sync is still running, so some notebooks may be missing." }),
+                results: hits,
+              })
+            : ok(`No pages contain all of: ${query}. Try fewer or shorter words.`);
+        }
+        const needle = query.toLowerCase();
+        const secs = await allSections(token);
+        const perSection = await mapLimited(secs, 4, async (s) => {
+          try {
+            return (await sectionPages(token, s.id, 100))
+              .filter((p) => (p.title || "").toLowerCase().includes(needle))
+              .map((p) => ({ ...slim(p), section: s.name, section_id: s.id, notebook: s.notebook }));
+          } catch {
+            return []; // encrypted (password-protected) sections can't be read; skip them
+          }
+        });
+        const hits = perSection.flat().slice(0, clampLimit(limit, 20));
+        return hits.length ? asJson(hits) : ok("No page titles matched. Try fewer words, or browse with list_sections / list_pages.");
       } catch (e) {
         return fail(e);
       }
@@ -249,22 +346,90 @@ function buildServer(token) {
     {
       title: "Read a page",
       description:
-        "Read the text of one OneNote page. Long pages are returned in chunks: use offset to continue where the previous chunk ended.",
+        "Read the text of one OneNote page, headed by its notebook and section (read every page in that context: the same section " +
+        "names mean different things in different notebooks). Reads live from OneNote; if that fails (or the page was deleted) it " +
+        "returns the local backup copy. Pass version_saved_at (from page_history) to read an earlier version. Long pages come in " +
+        "chunks: use offset to continue.",
       inputSchema: {
         page_id: z.string().describe("Page id from list_pages, recent_pages or search_pages"),
         offset: z.number().int().min(0).optional().describe("Character position to start from (default 0)"),
         max_chars: z.number().int().min(1000).max(100000).optional().describe("Chunk size (default 30000)"),
+        version_saved_at: z.string().optional().describe("Read an earlier version kept by the backup (a saved_at from page_history)"),
       },
       annotations: readOnly,
     },
-    async ({ page_id, offset = 0, max_chars = 30000 }) => {
-      try {
-        const html = await graph(token, `/me/onenote/pages/${encodeURIComponent(page_id)}/content`);
-        const text = htmlToText(typeof html === "string" ? html : JSON.stringify(html));
+    async ({ page_id, offset = 0, max_chars = 30000, version_saved_at }) => {
+      const local = db.prepare("SELECT title, notebook, section, text, fetched_at, deleted_at FROM pages WHERE id = ?").get(page_id);
+      const where = local ? `[Notebook: ${local.notebook} › Section: ${local.section}]\n\n` : "";
+      const chunked = (text, note = "") => {
         const chunk = text.slice(offset, offset + max_chars);
         const end = offset + chunk.length;
         const more = end < text.length ? `\n\n[Chunk ends at character ${end} of ${text.length}. Call get_page again with offset=${end} to continue.]` : "";
-        return ok((chunk || "(This page has no readable text.)") + more);
+        return ok(note + where + (chunk || "(This page has no readable text.)") + more);
+      };
+      if (version_saved_at) {
+        const v = db.prepare("SELECT text FROM page_versions WHERE page_id = ? AND saved_at = ?").get(page_id, version_saved_at);
+        return v ? chunked(v.text || "", `[Earlier version, replaced on ${version_saved_at}]\n`) : fail("No version saved at that time; see page_history.");
+      }
+      try {
+        const html = await graph(token, `/me/onenote/pages/${encodeURIComponent(page_id)}/content`);
+        return chunked(htmlToText(typeof html === "string" ? html : JSON.stringify(html)));
+      } catch (e) {
+        if (local?.text != null)
+          return chunked(
+            local.text,
+            `[From the local backup, saved ${local.fetched_at}${local.deleted_at ? `; deleted in OneNote around ${local.deleted_at}` : ""}. Live read failed: ${e.message}]\n`,
+          );
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "page_history",
+    {
+      title: "Earlier versions of a page",
+      description: "List the earlier versions of a page that the backup kept each time its content changed (newest first).",
+      inputSchema: { page_id: z.string().describe("Page id") },
+      annotations: readOnly,
+    },
+    async ({ page_id }) => {
+      const rows = db
+        .prepare("SELECT saved_at, title, length(text) AS chars FROM page_versions WHERE page_id = ? ORDER BY saved_at DESC")
+        .all(page_id)
+        .map((r) => ({ ...r }));
+      return rows.length ? asJson(rows) : ok("No earlier versions kept for this page (it hasn't changed since the backup started).");
+    },
+  );
+
+  server.registerTool(
+    "sync_status",
+    {
+      title: "Local copy status",
+      description:
+        "State of the local copy/backup: whether sync is armed, last successful sync, page counts, kept versions, sections by status " +
+        "(ok, encrypted, excluded, error) and the last run's errors.",
+      inputSchema: {},
+      annotations: readOnly,
+    },
+    async () => asJson(sync.status()),
+  );
+
+  server.registerTool(
+    "sync_now",
+    {
+      title: "Refresh the local copy now",
+      description:
+        "Start a sync now (it normally runs every hour) and wait up to 50 seconds for it. Only changed sections are re-read unless full is true. " +
+        "Reads OneNote; writes only to the local copy on this server.",
+      inputSchema: { full: z.boolean().optional().describe("Re-read every section, not just changed ones") },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ full }) => {
+      try {
+        const p = sync.start(full ? "manual full" : "manual", { full: Boolean(full) });
+        const done = await Promise.race([p, new Promise((r) => setTimeout(() => r(null), 50_000))]);
+        return asJson(done ? { finished: true, ...done } : { finished: false, note: "Still running in the background; check sync_status later." });
       } catch (e) {
         return fail(e);
       }
@@ -273,6 +438,35 @@ function buildServer(token) {
 
   return server;
 }
+
+// ---------- Local copy ----------
+const db = openStore(DATA_DIR);
+const hasCopy = () => Boolean(db.prepare("SELECT 1 FROM pages WHERE hash IS NOT NULL LIMIT 1").get());
+const sync = createSync({
+  db,
+  dataDir: DATA_DIR,
+  graphBase: GRAPH_BASE,
+  tokenUrl: TOKEN_URL,
+  clientId: MS_CLIENT_ID,
+  clientSecret: MS_CLIENT_SECRET,
+  scopes: SCOPES,
+  allowedEmail: ALLOWED_EMAIL,
+  htmlToText,
+  exclude: SYNC_EXCLUDE,
+});
+
+function scheduledSync() {
+  const lastFull = db.prepare("SELECT value FROM meta WHERE key = 'last_full'").get()?.value;
+  const full = !lastFull || Date.now() - Date.parse(lastFull) > FULL_RESYNC_DAYS * 86_400_000;
+  sync
+    .start(full ? "scheduled full" : "scheduled", { full })
+    .then((s) => {
+      if (full && !s.errors.length) db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES('last_full', ?)").run(new Date().toISOString());
+    })
+    .catch((e) => console.warn("Scheduled sync failed:", e.message));
+}
+setTimeout(scheduledSync, 20_000); // shortly after start (no-op until armed)
+setInterval(scheduledSync, SYNC_INTERVAL_MIN * 60_000);
 
 // ---------- Web server ----------
 const app = express();
@@ -372,6 +566,7 @@ app.post("/token", async (req, res) => {
     });
     const data = await r.json().catch(() => ({ error: "server_error" }));
     if (!r.ok) console.warn(`Token request failed: ${r.status} ${data.error || ""}`);
+    else sync.captureSignIn(data); // keeps the background sync's own sign-in fresh (owner only)
     noStore(res).status(r.status).json(data);
   } catch (e) {
     console.error("Token request error:", e.message);
