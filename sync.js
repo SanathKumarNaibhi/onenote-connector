@@ -106,6 +106,29 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
     return out;
   }
 
+  // Every page of a section. OneNote stops at 100 pages per request and doesn't always send a
+  // nextLink, so keep asking with $skip until a short page comes back. Stable order by creation.
+  async function sectionPageList(sectionId) {
+    const PAGE = 100;
+    const seen = new Map();
+    for (let skip = 0; skip < 20000; skip += PAGE) {
+      let url =
+        `/me/onenote/sections/${encodeURIComponent(sectionId)}/pages` +
+        `?$select=id,title,createdDateTime,lastModifiedDateTime&$orderby=createdDateTime&$top=${PAGE}&$skip=${skip}`;
+      let got = 0;
+      let followed = false;
+      while (url) {
+        const d = await get(url);
+        got += d.value.length;
+        for (const p of d.value) seen.set(p.id, p);
+        url = d["@odata.nextLink"];
+        if (url) followed = true;
+      }
+      if (followed || got < PAGE) break; // Microsoft paged it for us, or this was the last batch
+    }
+    return [...seen.values()];
+  }
+
   const isExcluded = (s) =>
     exclude.some((x) => {
       const [nb, sec] = x.includes("/") ? x.split("/").map((t) => t.trim().toLowerCase()) : [null, x.trim().toLowerCase()];
@@ -118,15 +141,13 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
     ON CONFLICT(id) DO UPDATE SET name = excluded.name, notebook = excluded.notebook,
       group_path = excluded.group_path, graph_modified = excluded.graph_modified`);
 
-  async function syncSection(s, stats) {
+  async function syncSection(s, stats, { onlyNew = false } = {}) {
     const existing = new Map(
       db.prepare("SELECT id, hash, title, file_path, deleted_at, error FROM pages WHERE section_id = ?").all(s.id).map((p) => [p.id, p]),
     );
     let pages;
     try {
-      pages = await getAll(
-        `/me/onenote/sections/${encodeURIComponent(s.id)}/pages?$select=id,title,createdDateTime,lastModifiedDateTime&$top=100`,
-      );
+      pages = await sectionPageList(s.id);
     } catch (e) {
       if (e.throttled) throw e;
       const status = e.status === 403 ? "encrypted" : "error";
@@ -141,6 +162,8 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
       seen.add(p.id);
       const old = existing.get(p.id);
       const meta = { id: p.id, title: p.title || "(untitled)", notebook: s.notebook, section: s.name };
+      // Catching up on pages past the first 100 of an unchanged section: the ones already copied are current.
+      if (onlyNew && old?.hash && !old.deleted_at) continue;
       let html;
       try {
         html = await get(`/me/onenote/pages/${encodeURIComponent(p.id)}/content`, { asText: true });
@@ -191,6 +214,7 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
     }
     db.prepare("UPDATE sections SET status = ?, error = NULL, last_synced = ?, page_count = ?, synced_modified = CASE WHEN ? THEN graph_modified ELSE synced_modified END WHERE id = ?")
       .run(ok ? "ok" : "partial", nowIso(), pages.length, ok ? 1 : 0, s.id);
+    if (ok) setMeta(db, `paged:${s.id}`, nowIso());
     return ok;
   }
 
@@ -217,10 +241,13 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
           stats.skipped.push(`${s.notebook} › ${s.name} (excluded)`);
           continue;
         }
-        const row = db.prepare("SELECT synced_modified, status FROM sections WHERE id = ?").get(s.id);
-        if (!full && row?.synced_modified === s.modified && row?.status === "ok") continue;
+        const row = db.prepare("SELECT synced_modified, status, page_count FROM sections WHERE id = ?").get(s.id);
+        // Sections copied before paging past 100 was fixed may be cut off at exactly 100: re-read once.
+        const maybeCut = row?.page_count > 0 && row.page_count % 100 === 0 && !getMeta(db, `paged:${s.id}`);
+        if (!full && !maybeCut && row?.synced_modified === s.modified && row?.status === "ok") continue;
         if (!full && row?.status === "encrypted" && row?.synced_modified === s.modified) continue;
-        const done = await syncSection(s, stats);
+        const unchanged = row?.synced_modified === s.modified && row?.status === "ok";
+        const done = await syncSection(s, stats, { onlyNew: !full && maybeCut && unchanged });
         if (db.prepare("SELECT status FROM sections WHERE id = ?").get(s.id)?.status === "encrypted") {
           db.prepare("UPDATE sections SET synced_modified = graph_modified WHERE id = ?").run(s.id);
           stats.skipped.push(`${s.notebook} › ${s.name} (password-protected)`);
