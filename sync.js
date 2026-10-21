@@ -13,12 +13,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 class ThrottledError extends Error {
   constructor() {
-    super("Microsoft is rate-limiting requests for this account; the sync paused and resumes at the next scheduled run.");
+    super("Microsoft rate-limited this account (limit: 400 requests/hour); the sync paused for 15 minutes and continues at the next scheduled run.");
     this.throttled = true;
   }
 }
 
-export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientSecret, scopes, allowedEmail, htmlToText, exclude = [], paceMs = 3000, log = console }) {
+export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientSecret, scopes, allowedEmail, htmlToText, exclude = [], budget, log = console }) {
   let running = null; // the promise of the sync in progress
   let lastRun = null; // summary of the last finished run
 
@@ -61,26 +61,23 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
     }
   }
 
-  // GET, paced so the sync never uses up the account's Microsoft quota (Claude's live reads
-  // share it). On throttling it backs off; if Microsoft keeps refusing, the whole run stops
-  // and resumes at the next scheduled sync instead of failing page after page.
-  let nextSlot = 0;
+  // GET within the shared budget (see budget.js). Waits while the rolling hour is used up.
+  // On a 429 it does not retry (OneNote sends no Retry-After, and retries add to the count):
+  // the run stops, the sync pauses 15 minutes, and the next run continues where this one stopped.
   async function get(pathOrUrl, { asText = false } = {}) {
     const url = pathOrUrl.startsWith("http") ? pathOrUrl : graphBase + pathOrUrl;
     for (let attempt = 0; ; attempt++) {
-      const wait = nextSlot - Date.now();
-      if (wait > 0) await sleep(wait);
-      nextSlot = Date.now() + paceMs;
-      const r = await fetch(url, { headers: { Authorization: `Bearer ${await accessToken()}` } });
+      for (let wait = budget.syncWaitMs(); wait > 0; wait = budget.syncWaitMs()) await sleep(Math.min(wait, 5 * 60_000));
+      const token = await accessToken();
+      budget.record();
+      const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
       if (r.ok) return asText ? r.text() : r.json();
       if (r.status === 429) {
-        if (attempt >= 2) throw new ThrottledError();
-        const retryAfter = Number(r.headers.get("retry-after")) * 1000 || 60_000 * (attempt + 1);
-        await sleep(Math.min(retryAfter, 5 * 60_000));
-        continue;
+        budget.throttled();
+        throw new ThrottledError();
       }
-      if (r.status >= 500 && attempt < 3) {
-        await sleep(2000 * 2 ** attempt);
+      if (r.status >= 500 && attempt < 2) {
+        await sleep(5000 * 2 ** attempt);
         continue;
       }
       if (r.status === 401 && attempt < 1) {
@@ -273,6 +270,7 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
     }
     return {
       armed: Boolean(loadRefreshToken(db, clientSecret)),
+      microsoft_usage: budget.usage(),
       running: Boolean(running),
       last_success: getMeta(db, "last_success"),
       pages_in_copy: counts.pages - (counts.deleted || 0),

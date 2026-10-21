@@ -6,6 +6,7 @@
 import express from "express";
 import { openStore, searchIndex } from "./store.js";
 import { createSync } from "./sync.js";
+import { createBudget } from "./budget.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { convert } from "html-to-text";
@@ -40,8 +41,13 @@ const TOKEN_URL = `${LOGIN_BASE}/${MS_TENANT}/oauth2/v2.0/token`;
 // Local copy + sync settings
 const DATA_DIR = env.DATA_DIR || "/data";
 const SYNC_INTERVAL_MIN = Math.max(15, Number(env.SYNC_INTERVAL_MIN || 60));
-const FULL_RESYNC_DAYS = Math.max(1, Number(env.FULL_RESYNC_DAYS || 7)); // re-read everything weekly, in case a section date didn't move
-const SYNC_PACE_MS = Math.max(0, Number(env.SYNC_PACE_MS ?? 3000)); // gap between Microsoft requests during sync (~20/min)
+const FULL_RESYNC_DAYS = Math.max(1, Number(env.FULL_RESYNC_DAYS || 30)); // re-read everything monthly, in case a section date didn't move
+// Microsoft allows this app 400 OneNote requests per hour for your account; the sync uses at most
+// SYNC_HOURLY_BUDGET of them and leaves the rest for Claude's live reads (see budget.js).
+const TESTING = env.BUDGET_TEST_MODE === "1"; // only for the automated tests against a fake Microsoft
+const SYNC_HOURLY_BUDGET = TESTING ? Number(env.SYNC_HOURLY_BUDGET) : Math.min(380, Math.max(50, Number(env.SYNC_HOURLY_BUDGET || 300)));
+const SYNC_PER_MINUTE = TESTING ? Number(env.SYNC_PER_MINUTE) : Math.min(100, Math.max(1, Number(env.SYNC_PER_MINUTE || 30)));
+const THROTTLE_PAUSE_MS = TESTING ? Number(env.THROTTLE_PAUSE_MS) : 15 * 60_000;
 const SYNC_EXCLUDE =(env.SYNC_EXCLUDE || "").split(",").map((s) => s.trim()).filter(Boolean); // e.g. "Sanath Kumar's Notebook/Archive"
 
 // ---------- Small helpers ----------
@@ -49,6 +55,7 @@ const noStore = (res) => res.set("Cache-Control", "no-store");
 
 async function graph(token, pathOrUrl) {
   const url = pathOrUrl.startsWith("http") ? pathOrUrl : GRAPH_BASE + pathOrUrl;
+  budget.record(); // counts toward Microsoft's 400/hour, so the sync yields to live reads
   const r = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json, text/html" } });
   if (!r.ok) {
     let detail = "";
@@ -60,7 +67,7 @@ async function graph(token, pathOrUrl) {
     }
     const hint =
       r.status === 429
-        ? " (Microsoft is rate-limiting requests; try again in a minute.)"
+        ? " (Microsoft allows 400 OneNote requests per hour for this account and that window is used up; it frees up within the hour. search_pages and get_page fall back to the VPS copy.)"
         : r.status === 404
           ? " (Not found: the id may be wrong or the item may have been deleted.)"
           : "";
@@ -442,6 +449,7 @@ function buildServer(token) {
 
 // ---------- Local copy ----------
 const db = openStore(DATA_DIR);
+const budget = createBudget(db, { syncHourly: SYNC_HOURLY_BUDGET, syncPerMinute: SYNC_PER_MINUTE, pauseMs: THROTTLE_PAUSE_MS });
 const hasCopy = () => Boolean(db.prepare("SELECT 1 FROM pages WHERE hash IS NOT NULL LIMIT 1").get());
 const sync = createSync({
   db,
@@ -454,7 +462,7 @@ const sync = createSync({
   allowedEmail: ALLOWED_EMAIL,
   htmlToText,
   exclude: SYNC_EXCLUDE,
-  paceMs: SYNC_PACE_MS,
+  budget,
 });
 
 // Normal runs re-read only sections whose date moved (or that didn't finish last time), so the

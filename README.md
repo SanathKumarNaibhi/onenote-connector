@@ -1,14 +1,18 @@
 # OneNote connector for Claude
 
 A private, read-only MCP connector for one personal Microsoft account's OneNote. It also keeps a
-**full local copy** of every page on this server, for full-text search and as a backup.
+**full copy** of every page on this server (the VPS), for full-text search and as a backup.
 
 ## What it does
 
 - **Live tools**: list notebooks, sections and pages; read any page (headed with its notebook and section).
 - **VPS copy** (in `/data`): every page's HTML and text, refreshed every hour; only sections whose
-  date moved are re-read, plus a full pass once a week. Requests are paced (about 20 a minute), and if
-  Microsoft rate-limits the account the run pauses and continues at the next hourly sync.
+  date moved are re-read, plus a full pass once a month.
+- **Stays inside Microsoft's limits**: OneNote allows one app 400 requests per hour and 120 per minute
+  for one user ([docs](https://learn.microsoft.com/en-us/graph/throttling-limits#onenote-service-limits)).
+  Every request is counted in a rolling window (kept across restarts). The sync uses at most 300 an hour
+  and 30 a minute, leaving the rest for Claude's live reads. If Microsoft still answers 429, the sync
+  pauses 15 minutes and later continues where it stopped.
 - **Full-text search** over titles and page text, in any script (English, Kannada, transliteration).
   Any 3+ letter fragment matches.
 - **Backup behaviour**: pages deleted in OneNote are kept and marked deleted. Each time a page's
@@ -34,8 +38,9 @@ Optional environment variables:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SYNC_INTERVAL_MIN` | `60` | Minutes between syncs (minimum 15) |
-| `SYNC_PACE_MS` | `3000` | Gap between Microsoft requests during a sync. Lower is faster but risks Microsoft's rate limit, which also blocks Claude's live reads |
-| `FULL_RESYNC_DAYS` | `7` | Days between full re-reads of every section |
+| `SYNC_HOURLY_BUDGET` | `300` | Requests per rolling hour the sync may use (50–380; Microsoft's cap is 400) |
+| `SYNC_PER_MINUTE` | `30` | Requests per minute the sync may use (max 100; Microsoft's cap is 120) |
+| `FULL_RESYNC_DAYS` | `30` | Days between full re-reads of every section |
 | `SYNC_EXCLUDE` | (none) | Comma-separated sections to leave out of the copy, as `Notebook/Section` or `Section` |
 | `DATA_DIR` | `/data` | Where the copy lives |
 

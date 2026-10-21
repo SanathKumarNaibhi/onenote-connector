@@ -2,7 +2,7 @@ FROM node:22-alpine
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY server.js store.js sync.js ./
+COPY server.js store.js sync.js budget.js ./
 # The local copy of your notes lives here. Mount a persistent volume at /data (see README).
 RUN mkdir -p /data && chown node:node /data
 VOLUME /data
