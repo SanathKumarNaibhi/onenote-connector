@@ -21,6 +21,7 @@ class ThrottledError extends Error {
 export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientSecret, scopes, allowedEmail, htmlToText, exclude = [], budget, log = console }) {
   let running = null; // the promise of the sync in progress
   let lastRun = null; // summary of the last finished run
+  let current = null; // live progress of the run in progress
 
   // ---- Microsoft access ----
   let cached = { token: null, exp: 0 };
@@ -117,6 +118,7 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
         `?$select=id,title,createdDateTime,lastModifiedDateTime&$orderby=createdDateTime&$top=${PAGE}&$skip=${skip}`;
       let got = 0;
       let followed = false;
+      const before = seen.size;
       while (url) {
         const d = await get(url);
         got += d.value.length;
@@ -125,6 +127,7 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
         if (url) followed = true;
       }
       if (followed || got < PAGE) break; // Microsoft paged it for us, or this was the last batch
+      if (seen.size === before) break; // Microsoft ignored $skip and repeated itself: stop, don't loop
     }
     return [...seen.values()];
   }
@@ -158,7 +161,10 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
 
     let ok = true;
     const seen = new Set();
+    let done = 0;
+    if (current) Object.assign(current, { section: `${s.notebook} › ${s.name}`, section_pages: pages.length, section_done: 0, mode: onlyNew ? "new pages only" : "all pages" });
     for (const p of pages) {
+      if (current) current.section_done = done++;
       seen.add(p.id);
       const old = existing.get(p.id);
       const meta = { id: p.id, title: p.title || "(untitled)", notebook: s.notebook, section: s.name };
@@ -222,6 +228,7 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
   async function run(reason, { full = false } = {}) {
     const started = nowIso();
     const stats = { reason, started, sectionsChecked: 0, sectionsSynced: 0, fetched: 0, added: 0, updated: 0, removed: 0, skipped: [], errors: [] };
+    current = { started, stats };
     try {
       const sections = await getAll(
         "/me/onenote/sections?$select=id,displayName,lastModifiedDateTime&$expand=parentNotebook($select=displayName),parentSectionGroup($select=displayName)&$top=100",
@@ -269,6 +276,7 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
     stats.finished = nowIso();
     stats.errors = stats.errors.slice(0, 20);
     lastRun = stats;
+    current = null;
     setMeta(db, "last_run", JSON.stringify(stats));
     log.log(`Sync (${reason}) done: ${stats.added} added, ${stats.updated} updated, ${stats.removed} removed, ${stats.errors.length} errors.`);
     return stats;
@@ -299,6 +307,7 @@ export function createSync({ db, dataDir, graphBase, tokenUrl, clientId, clientS
       armed: Boolean(loadRefreshToken(db, clientSecret)),
       microsoft_usage: budget.usage(),
       running: Boolean(running),
+      ...(current ? { progress: { section: current.section, section_pages: current.section_pages, section_done: current.section_done, mode: current.mode, this_run: { fetched: current.stats.fetched, added: current.stats.added, updated: current.stats.updated, sections_synced: current.stats.sectionsSynced } } } : {}),
       last_success: getMeta(db, "last_success"),
       pages_in_copy: counts.pages - (counts.deleted || 0),
       pages_deleted_in_onenote_but_kept: counts.deleted || 0,
