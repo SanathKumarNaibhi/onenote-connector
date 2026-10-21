@@ -110,7 +110,7 @@ export function searchIndex(db, query, limit) {
     const match = long.map((t) => `"${t.replace(/"/g, '""')}"`).join(" ");
     rows = db
       .prepare(
-        `SELECT ${cols}, snippet(page_fts, 2, '«', '»', ' … ', 24) AS snippet
+        `SELECT ${cols}, snippet(page_fts, 2, '«', '»', ' … ', 64) AS snippet
          FROM page_fts JOIN pages p ON p.id = page_fts.page_id
          WHERE page_fts MATCH ? ORDER BY bm25(page_fts, 0, 8, 1) LIMIT ?`,
       )

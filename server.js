@@ -355,18 +355,20 @@ function buildServer(token) {
       title: "Read a page",
       description:
         "Read the text of one OneNote page, headed by its notebook and section (read every page in that context: the same section " +
-        "names mean different things in different notebooks). Reads live from OneNote; if that fails (or the page was deleted) it " +
-        "returns the local backup copy. Pass version_saved_at (from page_history) to read an earlier version. Long pages come in " +
-        "chunks: use offset to continue.",
+        "names mean different things in different notebooks). Reads from the VPS copy (refreshed hourly; uses none of Microsoft's " +
+        "400/hour allowance); pass live: true for the exact current version from OneNote. Pages not yet in the copy are read live. " +
+        "Pass version_saved_at (from page_history) to read an earlier version. Long pages come in chunks: use offset to continue. " +
+        "To read many pages, prefer read_section.",
       inputSchema: {
         page_id: z.string().describe("Page id from list_pages, recent_pages or search_pages"),
         offset: z.number().int().min(0).optional().describe("Character position to start from (default 0)"),
         max_chars: z.number().int().min(1000).max(100000).optional().describe("Chunk size (default 30000)"),
         version_saved_at: z.string().optional().describe("Read an earlier version kept by the backup (a saved_at from page_history)"),
+        live: z.boolean().optional().describe("Read from OneNote itself instead of the VPS copy (uses Microsoft's allowance)"),
       },
       annotations: readOnly,
     },
-    async ({ page_id, offset = 0, max_chars = 30000, version_saved_at }) => {
+    async ({ page_id, offset = 0, max_chars = 30000, version_saved_at, live }) => {
       const local = db.prepare("SELECT title, notebook, section, text, fetched_at, deleted_at FROM pages WHERE id = ?").get(page_id);
       const where = local ? `[Notebook: ${local.notebook} › Section: ${local.section}]\n\n` : "";
       const chunked = (text, note = "") => {
@@ -379,6 +381,7 @@ function buildServer(token) {
         const v = db.prepare("SELECT text FROM page_versions WHERE page_id = ? AND saved_at = ?").get(page_id, version_saved_at);
         return v ? chunked(v.text || "", `[Earlier version, replaced on ${version_saved_at}]\n`) : fail("No version saved at that time; see page_history.");
       }
+      if (!live && local?.text != null && !local.deleted_at) return chunked(local.text);
       try {
         const html = await graph(token, `/me/onenote/pages/${encodeURIComponent(page_id)}/content`);
         return chunked(htmlToText(typeof html === "string" ? html : JSON.stringify(html)));
@@ -390,6 +393,46 @@ function buildServer(token) {
           );
         return fail(e);
       }
+    },
+  );
+
+  server.registerTool(
+    "read_section",
+    {
+      title: "Read a whole section",
+      description:
+        "Read every page of a section in one go from the VPS copy (no Microsoft requests), oldest first, each page headed with its " +
+        "title and dates. Use this to read a notebook section thoroughly. Long sections come in chunks: call again with offset.",
+      inputSchema: {
+        section_id: z.string().describe("Section id from list_sections"),
+        offset: z.number().int().min(0).optional().describe("Character position to start from (default 0)"),
+        max_chars: z.number().int().min(5000).max(200000).optional().describe("Chunk size (default 80000)"),
+        newest_first: z.boolean().optional().describe("Order pages newest first instead of oldest first"),
+      },
+      annotations: readOnly,
+    },
+    async ({ section_id, offset = 0, max_chars = 80000, newest_first }) => {
+      const sec = db.prepare("SELECT name, notebook, status, last_synced FROM sections WHERE id = ?").get(section_id);
+      if (!sec) return fail("That section isn't in the VPS copy (check the id with list_sections, or wait for the next sync).");
+      if (sec.status === "encrypted") return fail("That section is password-protected; Microsoft doesn't serve it, so it isn't in the copy.");
+      const pages = db
+        .prepare(
+          `SELECT id, title, created, text FROM pages WHERE section_id = ? AND deleted_at IS NULL AND text IS NOT NULL
+           ORDER BY created ${newest_first ? "DESC" : "ASC"}`,
+        )
+        .all(section_id);
+      const full =
+        `[Notebook: ${sec.notebook} › Section: ${sec.name}; ${pages.length} pages; copy synced ${sec.last_synced}]\n\n` +
+        pages
+          .map((p) => {
+            const body = (p.text || "").replace(/^# .*\n+/, "").trim();
+            return `=== ${p.title || "(untitled)"} — created ${String(p.created).slice(0, 10)} — id ${p.id}\n\n${body || "(no text)"}`;
+          })
+          .join("\n\n");
+      const chunk = full.slice(offset, offset + max_chars);
+      const end = offset + chunk.length;
+      const more = end < full.length ? `\n\n[Chunk ends at character ${end} of ${full.length}. Call read_section again with offset=${end} to continue.]` : "";
+      return ok(chunk + more);
     },
   );
 
